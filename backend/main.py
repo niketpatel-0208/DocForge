@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from gitlab_client import GitLabClient, logger as gl_logger
+from gitlab_client import GitLabClient, EndpointFileContext, logger as gl_logger
 from go_parser import parse_go_files
 from php_parser import parse_php_files
 from infra_parser import parse_infra_files, INFRA_FILE_PATTERNS, INFRA_EXTENSIONS
@@ -458,7 +458,7 @@ def generate_api_targeted(body: TargetedGenerateRequest):
 
     app_logger.info("Using file: %s", resolved_file)
 
-    # ── Fetch file content ─────────────────────────────────────────────────────
+    # ── Fetch primary file content ─────────────────────────────────────────────
     try:
         file_content = gl.get_file(project_id, resolved_file, ref)
     except Exception as e:
@@ -467,25 +467,51 @@ def generate_api_targeted(body: TargetedGenerateRequest):
 
     app_logger.info("Fetched %d bytes from %s", len(file_content), resolved_file)
 
-    # ── Parse endpoints from the file ─────────────────────────────────────────
-    sources = {resolved_file: file_content}
-    endpoints = []
+    # ── Gather full endpoint context: routes + models ──────────────────────────
+    app_logger.info("Gathering endpoint context (route file + model files)...")
+    ep_ctx: EndpointFileContext = gl.gather_endpoint_context(
+        project_id=project_id,
+        controller_file=resolved_file,
+        controller_source=file_content,
+        endpoint_hint=body.endpoint_name.strip() if body.endpoint_name.strip() else "",
+        ref=ref,
+    )
+
+    # Add context gather log to search_log
+    search_log.extend(ep_ctx.to_search_log())
+    app_logger.info(
+        "Context gathered: route=%s method=%s path=%s models=%d",
+        ep_ctx.route_file, ep_ctx.detected_method, ep_ctx.detected_path,
+        len(ep_ctx.model_files)
+    )
+
+    # Combined source for LLM (route file + controller + models)
+    combined_source = ep_ctx.all_sources_combined()
+    if not combined_source:
+        combined_source = file_content
+
+    # ── Parse endpoints (try route file first, then controller) ───────────────
     ext = os.path.splitext(resolved_file)[1].lower()
+    endpoints = []
+
+    # Try parsing the route file if we found one — it will have the HTTP method/path
+    parse_sources = {}
+    if ep_ctx.route_file and ep_ctx.route_source:
+        parse_sources[ep_ctx.route_file] = ep_ctx.route_source
+    parse_sources[resolved_file] = file_content
 
     if ext == ".go":
-        go_routes = parse_go_files(sources)
+        go_routes = parse_go_files(parse_sources)
         from normaliser import normalise_go_routes
         endpoints = [e.to_dict() for e in normalise_go_routes(go_routes, service_name)]
     elif ext == ".php":
-        php_routes = parse_php_files(sources)
+        php_routes = parse_php_files(parse_sources)
         from normaliser import normalise_php_routes
         endpoints = [e.to_dict() for e in normalise_php_routes(php_routes, service_name)]
 
-    app_logger.info(
-        "Parsed %d endpoint(s) from %s (ext=%s)", len(endpoints), resolved_file, ext
-    )
+    app_logger.info("Parsed %d endpoint(s) from files (ext=%s)", len(endpoints), ext)
 
-    # ── Filter by endpoint name if given ──────────────────────────────────────
+    # ── Filter by endpoint hint ────────────────────────────────────────────────
     if body.endpoint_name.strip() and endpoints:
         ep_hint = body.endpoint_name.strip().lower()
         filtered = [
@@ -494,28 +520,33 @@ def generate_api_targeted(body: TargetedGenerateRequest):
             or ep_hint in e.get("handler_name", "").lower()
         ]
         if filtered:
-            app_logger.info(
-                "Filtered endpoints from %d → %d by hint=%r",
-                len(endpoints), len(filtered), body.endpoint_name
-            )
+            app_logger.info("Filtered endpoints %d → %d by hint=%r",
+                            len(endpoints), len(filtered), body.endpoint_name)
             endpoints = filtered
-        else:
-            app_logger.info(
-                "No endpoints matched hint=%r; using all %d endpoints",
-                body.endpoint_name, len(endpoints)
-            )
 
-    # ── Fallback: synthesise a single endpoint context from the file ──────────
+    # ── Synthesise endpoint if parser found nothing ────────────────────────────
     if not endpoints:
+        # Use detected method/path from route extraction if available
+        detected_method = ep_ctx.detected_method or "POST"
+        detected_path = (
+            ep_ctx.detected_path
+            or (body.endpoint_name if body.endpoint_name.startswith("/")
+                else f"/{body.endpoint_name}" if body.endpoint_name else "/unknown")
+        )
+        detected_handler = (
+            ep_ctx.detected_handler_func
+            or os.path.splitext(os.path.basename(resolved_file))[0]
+        )
         app_logger.warning(
-            "No endpoints parsed from %s; synthesising from file content", resolved_file
+            "No endpoints parsed; synthesising: method=%s path=%s handler=%s",
+            detected_method, detected_path, detected_handler
         )
         endpoints = [{
             "service_name": service_name,
             "language": "go" if ext == ".go" else ("php" if ext == ".php" else "unknown"),
-            "method": "POST",
-            "path": body.endpoint_name or "/unknown",
-            "handler_name": os.path.splitext(os.path.basename(resolved_file))[0],
+            "method": detected_method,
+            "path": detected_path,
+            "handler_name": detected_handler,
             "file": resolved_file,
             "line": 1,
             "comments": [],
@@ -525,16 +556,17 @@ def generate_api_targeted(body: TargetedGenerateRequest):
             "existing_doc_fragment": "",
         }]
 
-    # ── Generate docs for each matched endpoint ────────────────────────────────
+    # ── Generate docs ──────────────────────────────────────────────────────────
     results = []
     for ep in endpoints:
-        app_logger.info("Generating doc for endpoint path=%s handler=%s", ep.get("path"), ep.get("handler_name"))
+        app_logger.info("Generating doc: method=%s path=%s handler=%s",
+                        ep.get("method"), ep.get("path"), ep.get("handler_name"))
         try:
             yaml_text, confidence, missing_fields = generate_api_doc(
-                ep, api_key=api_key, handler_source=file_content
+                ep, api_key=api_key, handler_source=combined_source
             )
         except Exception as e:
-            app_logger.error("LLM error for endpoint %s: %s", ep.get("path"), e)
+            app_logger.error("LLM error for %s: %s", ep.get("path"), e)
             raise HTTPException(500, f"LLM API error: {e}")
 
         score = score_openapi_yaml(yaml_text)
@@ -554,6 +586,8 @@ def generate_api_targeted(body: TargetedGenerateRequest):
         "results": results,
         "resolved_file": resolved_file,
         "file_path": resolved_file,
+        "route_file": ep_ctx.route_file,
+        "model_files": list(ep_ctx.model_files.keys()),
         "endpoints_found": len(endpoints),
         "search_log": search_log,
         "project_id": project_id,

@@ -109,13 +109,21 @@ ABSOLUTE RULES — VIOLATION OF ANY WILL FAIL THE EVALUATION:
 10. The output MUST be at least 200 lines of YAML. Skeleton docs are unacceptable."""
 
 _API_DOC_USER = """Generate a comprehensive OpenAPI 3.0 YAML specification for this API endpoint.
-You MUST study the handler source code line by line and extract EVERY:
-- Request parameter (from query params, path params, form fields, JSON body fields)
-- Validation check (every if/else that returns an error)
-- Response code and message (every c.JSON, w.Write, http.Error, return statement)
-- Error string literal (these become your response examples)
-- Queue/DB/Redis interaction (these become your Key Behavior bullet points)
-- Struct field with json tags (these become your response schema properties)
+
+The source code below may contain MULTIPLE FILES (route registration file, controller/handler file,
+and model/struct files). You MUST read ALL of them to produce accurate documentation.
+
+CRITICAL EXTRACTION RULES:
+1. ROUTE FILE (if present): Extract the EXACT HTTP method and URL path from the route registration.
+   Look for patterns like: r.POST("/path", Handler), router.GET("/path", Handler), HandleFunc("/path", h)
+2. CONTROLLER FILE: Extract ALL handler function logic – every if/else branch, every error return,
+   every success response, every c.JSON/w.Write/http.Error call.
+3. MODEL/STRUCT FILES: For EVERY struct used in request binding or JSON response:
+   - Read ALL json tags exactly: `json:"field_name"` → field name in the API
+   - Read ALL `binding:"required"` or `validate:"required"` tags → mandatory fields
+   - Fields with `json:",omitempty"` or no binding tag → optional fields
+   - Read field TYPES exactly (string, int, bool, []string, etc.)
+   - Read COMMENTS on fields as descriptions
 
 SERVICE METADATA:
 - Service Name: {service_name}
@@ -131,13 +139,13 @@ ENDPOINT METADATA:
 - Detected Parameters: {params}
 - Detected Returns: {returns}
 
-HANDLER SOURCE CODE — THIS IS YOUR PRIMARY SOURCE OF TRUTH.
-Read every line. Extract every parameter, validation, and response from it:
+FULL SOURCE CODE (route file + controller + models) – YOUR COMPLETE SOURCE OF TRUTH:
+Read every file section carefully. The section headers tell you which file type each block is.
 ```
 {handler_source}
 ```
 
-EXISTING DOC FRAGMENT (if any — use as reference but improve):
+EXISTING DOC FRAGMENT (if any – use as reference but improve):
 {existing_doc_fragment}
 
 EXAMPLE OF EXPECTED OUTPUT QUALITY — your output must match this level of detail and length:
@@ -392,10 +400,10 @@ def generate_api_doc(
         comments="\n".join(endpoint.get("comments", [])),
         params=str(endpoint.get("params", [])),
         returns=str(endpoint.get("returns", [])),
-        handler_source=handler_source[:20000] if handler_source else "(source not available — infer from metadata above)",
+        handler_source=handler_source[:30000] if handler_source else "(source not available — infer from metadata above)",
         existing_doc_fragment=endpoint.get("existing_doc_fragment", ""),
     )
-    raw = call_claude(_API_DOC_SYSTEM, user, max_tokens=8000, api_key=api_key, retries=1)
+    raw = call_claude(_API_DOC_SYSTEM, user, max_tokens=12000, api_key=api_key, retries=1)
     yaml_text, confidence, missing = _parse_api_doc_output(raw)
     return yaml_text, confidence, missing
 

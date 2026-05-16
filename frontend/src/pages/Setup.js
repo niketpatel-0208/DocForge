@@ -1,44 +1,32 @@
-import React, { useState, useEffect } from 'react';
-import { validateAuth, setStoredRepoUrl, getStoredRepoUrl } from '../api';
+import React, { useState } from 'react';
+import { validateAuth, setStoredRepoUrl } from '../api';
 
 export default function Setup({ onSuccess, isModal = false }) {
+  // Never autofill – user must type fresh credentials each time
   const [repoUrl, setRepoUrl] = useState('');
   const [gitlab, setGitlab] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
 
-  // Pre-fill from localStorage if available
-  useEffect(() => {
-    const storedToken = localStorage.getItem('docforge_gitlab_token') || '';
-    const storedUrl = getStoredRepoUrl();
-    if (storedToken) setGitlab(storedToken);
-    if (storedUrl) setRepoUrl(storedUrl);
-  }, []);
-
   const submit = async (e) => {
     e.preventDefault();
     setError('');
     setSuccess('');
-
     if (!gitlab.trim()) {
       setError('GitLab Personal Access Token is required.');
       return;
     }
-
     setLoading(true);
     try {
       const r = await validateAuth(gitlab.trim(), repoUrl.trim());
       if (r.ok) {
-        // Persist repo URL for later use
-        if (repoUrl.trim()) {
-          setStoredRepoUrl(repoUrl.trim());
-        }
+        if (repoUrl.trim()) setStoredRepoUrl(repoUrl.trim());
         const msg = r.project_name
           ? `Connected as ${r.user} · Repo: ${r.project_name}`
           : `Connected as ${r.user} (@${r.username})`;
         setSuccess(msg);
-        setTimeout(() => onSuccess(r), 600);
+        setTimeout(() => onSuccess(r, repoUrl.trim(), gitlab.trim()), 600);
       }
     } catch (err) {
       setError(
@@ -53,16 +41,16 @@ export default function Setup({ onSuccess, isModal = false }) {
   return (
     <div className={isModal ? '' : 'setup-wrap'}>
       {!isModal && (
-        <>
-          <h1 className="setup-title">⚙ DocForge</h1>
+        <div className="setup-hero">
+          <div className="setup-logo-mark">⚙</div>
+          <h1 className="setup-title">DocForge</h1>
           <p className="setup-sub">
-            Generate publish-ready API docs and SOPs from your GitLab source code.
+            Generate publish-ready API documentation from your GitLab source code — instantly.
           </p>
-        </>
+        </div>
       )}
-      <div className={isModal ? '' : 'card'}>
+      <div className={isModal ? '' : 'card setup-card'}>
         <form onSubmit={submit}>
-          {/* Repo URL */}
           <div className="form-group">
             <label className="label">GitLab Repository URL</label>
             <input
@@ -72,15 +60,14 @@ export default function Setup({ onSuccess, isModal = false }) {
               value={repoUrl}
               onChange={(e) => setRepoUrl(e.target.value)}
             />
-            <p style={{ fontSize: 12, color: 'var(--text2)', marginTop: 6 }}>
-              Full URL of the GitLab repository · Leave blank to connect without a specific repo
+            <p className="field-hint">
+              Full URL of the repository · Leave blank to connect without a specific repo
             </p>
           </div>
 
-          {/* GitLab PAT */}
           <div className="form-group">
             <label className="label">
-              GitLab Personal Access Token <span style={{ color: 'var(--red)' }}>*</span>
+              GitLab Personal Access Token <span className="required-star">*</span>
             </label>
             <input
               className="input"
@@ -90,50 +77,26 @@ export default function Setup({ onSuccess, isModal = false }) {
               onChange={(e) => setGitlab(e.target.value)}
               required
             />
-            <p style={{ fontSize: 12, color: 'var(--text2)', marginTop: 6 }}>
-              Needs: <code>read_api</code>, <code>read_repository</code> scopes on scm.intermesh.net
+            <p className="field-hint">
+              Needs <code>read_api</code>, <code>read_repository</code> scopes
             </p>
-          </div>
-
-          {/* Info banner – LiteLLM key is server-managed */}
-          <div
-            style={{
-              background: 'var(--surface2, #1e293b)',
-              border: '1px solid var(--border, #334155)',
-              borderRadius: 8,
-              padding: '10px 14px',
-              fontSize: 12,
-              color: 'var(--text2)',
-              marginBottom: 16,
-              display: 'flex',
-              gap: 8,
-              alignItems: 'flex-start',
-            }}
-          >
-            <span style={{ fontSize: 16 }}>🔑</span>
-            <span>
-              <strong>LLM access is pre-configured on the server</strong> — no API key input
-              needed. Model: <code>anthropic/claude-sonnet-4-6</code>
-            </span>
           </div>
 
           {error && <div className="error-banner">{error}</div>}
           {success && <div className="success-banner">{success}</div>}
 
           <button
-            className="btn btn-primary"
+            className="btn btn-primary btn-glow"
             type="submit"
             disabled={loading}
             style={{ marginTop: 8, width: '100%', justifyContent: 'center' }}
           >
             {loading ? (
-              <>
-                <span className="spinner" /> Connecting…
-              </>
+              <><span className="spinner" /> Connecting…</>
             ) : isModal ? (
               'Update & Verify'
             ) : (
-              'Connect & Continue'
+              'Connect & Generate Docs →'
             )}
           </button>
         </form>

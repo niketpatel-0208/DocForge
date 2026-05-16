@@ -286,13 +286,23 @@ def get_routes(
     php_sources: dict[str, str] = {}
     infra_sources: dict[str, str] = {}
 
-    for path in scan["go_file_list"][:20]:
+    # Prioritize route registration files so the parser finds HTTP method+path
+    _ROUTE_FILE_KEYWORDS = ("main", "route", "router", "server", "app", "api", "handler")
+
+    def _route_priority(path: str) -> int:
+        bn = os.path.basename(path).lower().replace(".go", "").replace(".php", "")
+        return 0 if any(kw in bn for kw in _ROUTE_FILE_KEYWORDS) else 1
+
+    go_list_sorted = sorted(scan["go_file_list"], key=_route_priority)
+    php_list_sorted = sorted(scan["php_file_list"], key=_route_priority)
+
+    for path in go_list_sorted[:30]:
         try:
             go_sources[path] = gl.get_file(project_id, path)
         except Exception:
             pass
 
-    for path in scan["php_file_list"][:20]:
+    for path in php_list_sorted[:30]:
         try:
             php_sources[path] = gl.get_file(project_id, path)
         except Exception:
@@ -320,7 +330,21 @@ def get_routes(
 
     packet_dict = packet.to_dict()
 
-    if not packet_dict["endpoints"] and not whole_file_mode:
+    # ── Deduplicate endpoints by (method, path) ───────────────────────────────
+    seen_eps: set[tuple] = set()
+    unique_endpoints = []
+    for ep in packet_dict.get("endpoints", []):
+        key = (ep.get("method", "").upper(), ep.get("path", ""))
+        if key not in seen_eps:
+            seen_eps.add(key)
+            unique_endpoints.append(ep)
+
+    app_logger.info(
+        "get_routes: %d raw endpoints → %d unique after dedup",
+        len(packet_dict.get("endpoints", [])), len(unique_endpoints)
+    )
+
+    if not unique_endpoints and not whole_file_mode:
         result = {
             "service_name": service_name,
             "endpoints": [],
@@ -333,7 +357,7 @@ def get_routes(
             "service_name": service_name,
             "language": packet_dict["language"],
             "framework": packet_dict["framework"],
-            "endpoints": packet_dict["endpoints"],
+            "endpoints": unique_endpoints,
             "infra": packet_dict["infra"],
             "file_list": packet_dict["file_list"],
             "last_commit_date": scan["last_commit_date"],
@@ -352,18 +376,44 @@ class GenerateApiRequest(BaseModel):
 
 @app.post("/generate/api")
 def generate_api(body: GenerateApiRequest, request: Request):
+    """
+    Full-scan doc generation. Uses gather_endpoint_context to collect
+    route file + model files for accurate documentation, same as targeted mode.
+    """
     api_key = _litellm_key()
     gl = _gl_from_token(request)
 
+    controller_file = body.endpoint.get("file", "")
     file_content = ""
     try:
-        file_content = gl.get_file(body.project_id, body.endpoint.get("file", ""))
+        file_content = gl.get_file(body.project_id, controller_file)
     except Exception:
         pass
 
+    # Use gather_endpoint_context for the same quality as targeted mode
+    combined_source = file_content
+    if controller_file and file_content:
+        try:
+            project_info = gl.get_repo(body.project_id)
+            ref = project_info.get("default_branch", "HEAD")
+            ep_ctx = gl.gather_endpoint_context(
+                project_id=body.project_id,
+                controller_file=controller_file,
+                controller_source=file_content,
+                endpoint_hint=body.endpoint.get("path", ""),
+                ref=ref,
+            )
+            combined_source = ep_ctx.all_sources_combined() or file_content
+            app_logger.info(
+                "generate_api: gathered context route=%s models=%d for %s",
+                ep_ctx.route_file, len(ep_ctx.model_files), controller_file
+            )
+        except Exception as e:
+            app_logger.warning("generate_api: context gather failed: %s", e)
+
     try:
         yaml_text, confidence, missing_fields = generate_api_doc(
-            body.endpoint, api_key=api_key, handler_source=file_content
+            body.endpoint, api_key=api_key, handler_source=combined_source
         )
     except Exception as e:
         raise HTTPException(500, f"LLM API error: {e}")
